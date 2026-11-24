@@ -1,0 +1,286 @@
+default:
+  image: eclipse-temurin:21-jdk
+  before_script:
+    - chmod +x mvnw
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+
+stages:
+  - build
+  - test
+  - quality
+  - security
+  - result
+
+variables:
+  MAVEN_OPTS: "-Dmaven.repo.local=$CI_PROJECT_DIR/.m2/repository"
+  MAVEN_CLI_OPTS: "--batch-mode --errors --fail-at-end"
+  APP_VERSION: "1.0.${CI_PIPELINE_IID}"
+
+compile:
+  stage: build
+  cache:
+    key: maven-${CI_COMMIT_REF_SLUG}
+    paths:
+      - .m2/repository/
+    policy: pull-push
+  script:
+    - ./mvnw $MAVEN_CLI_OPTS clean package -DskipTests
+  artifacts:
+    paths:
+      - target/*.jar
+      - target/classes/
+    expire_in: 2 hours
+
+unit-tests:
+  stage: test
+  needs: [compile]
+  cache:
+    key: maven-${CI_COMMIT_REF_SLUG}
+    paths:
+      - .m2/repository/
+    policy: pull
+  script:
+    - ./mvnw $MAVEN_CLI_OPTS test
+  artifacts:
+    when: always
+    paths:
+      - target/surefire-reports/
+      - target/site/jacoco/
+    reports:
+      junit: target/surefire-reports/TEST-*.xml
+  coverage: '/Total.*?([0-9]{1,3})%/'
+
+integration-tests:
+  stage: test
+  needs: [compile]
+  cache:
+    key: maven-${CI_COMMIT_REF_SLUG}
+    paths:
+      - .m2/repository/
+    policy: pull
+  script:
+    - ./mvnw $MAVEN_CLI_OPTS verify -Pintegration
+  artifacts:
+    when: always
+    paths:
+      - target/failsafe-reports/
+    reports:
+      junit: target/failsafe-reports/TEST-*.xml
+  rules:
+    - exists:
+        - src/test/java/**/*IT.java
+        - src/test/java/**/*IntegrationTest.java
+
+architecture-tests:
+  stage: test
+  needs: [compile]
+  cache:
+    key: maven-${CI_COMMIT_REF_SLUG}
+    paths:
+      - .m2/repository/
+    policy: pull
+  script:
+    - ./mvnw $MAVEN_CLI_OPTS test -Dtest="**/*ArchTest*,**/*ArchitectureTest*"
+  artifacts:
+    when: always
+    paths:
+      - target/surefire-reports/
+    reports:
+      junit: target/surefire-reports/TEST-*.xml
+  rules:
+    - exists:
+        - src/test/java/**/*ArchTest*.java
+        - src/test/java/**/*ArchitectureTest*.java
+
+sonarqube:
+  stage: quality
+  needs: [unit-tests]
+  variables:
+    SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"
+    GIT_DEPTH: 0
+  cache:
+    key: sonar-${CI_COMMIT_REF_SLUG}
+    paths:
+      - .sonar/cache
+      - .m2/repository/
+  script:
+    - >-
+      ./mvnw $MAVEN_CLI_OPTS verify sonar:sonar
+      -Dsonar.host.url=$SONAR_HOST_URL
+      -Dsonar.token=$SONAR_TOKEN
+      -Dsonar.projectKey=$CI_PROJECT_NAME
+      -Dsonar.projectName=$CI_PROJECT_NAME
+      -Dsonar.qualitygate.wait=true
+      -Dsonar.qualitygate.timeout=300
+      -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml
+      -Dsonar.java.binaries=target/classes
+      -Dsonar.sources=src/main/java
+      -Dsonar.tests=src/test/java
+  allow_failure: true
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH == "master"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+sast-semgrep:
+  stage: security
+  image: returntocorp/semgrep:latest
+  cache: []
+  needs: []
+  script:
+    - semgrep scan
+      --config auto
+      --config p/java
+      --config p/spring
+      --config p/owasp-top-ten
+      --json -o semgrep-report.json
+      --sarif -o semgrep-report.sarif
+      src/
+  artifacts:
+    when: always
+    paths:
+      - semgrep-report.json
+      - semgrep-report.sarif
+  allow_failure: true
+
+dependency-scan:
+  stage: security
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  cache: []
+  needs: []
+  script:
+    - trivy fs
+      --scanners vuln
+      --severity HIGH,CRITICAL
+      --format table
+      .
+    - trivy fs
+      --scanners vuln
+      --severity HIGH,CRITICAL
+      --format json
+      --output trivy-report.json
+      .
+  artifacts:
+    when: always
+    paths:
+      - trivy-report.json
+  allow_failure: true
+
+secret-detection:
+  stage: security
+  image:
+    name: zricethezav/gitleaks:latest
+    entrypoint: [""]
+  cache: []
+  needs: []
+  script:
+    - gitleaks detect
+      --source=.
+      --report-format=json
+      --report-path=gitleaks-report.json
+      --verbose
+  artifacts:
+    when: always
+    paths:
+      - gitleaks-report.json
+  allow_failure: false
+
+create-fail-release:
+  stage: result
+  when: on_failure
+  image: alpine:latest
+  before_script: []
+  script:
+    - apk add --no-cache git
+    - echo "=== FAIL-RELEASE v${APP_VERSION} ==="
+    - mkdir -p /tmp/reports
+    - echo "status=FAILED" > /tmp/reports/REPORT.txt
+    - echo "version=${APP_VERSION}" >> /tmp/reports/REPORT.txt
+    - echo "pipeline_id=${CI_PIPELINE_ID}" >> /tmp/reports/REPORT.txt
+    - echo "pipeline_url=${CI_PIPELINE_URL}" >> /tmp/reports/REPORT.txt
+    - echo "commit=${CI_COMMIT_SHA}" >> /tmp/reports/REPORT.txt
+    - echo "branch=${CI_COMMIT_BRANCH}" >> /tmp/reports/REPORT.txt
+    - echo "author=${GITLAB_USER_LOGIN}" >> /tmp/reports/REPORT.txt
+    - echo "date=$(date -Iseconds)" >> /tmp/reports/REPORT.txt
+    - cp target/surefire-reports/*.xml /tmp/reports/ || true
+    - cp target/failsafe-reports/*.xml /tmp/reports/ || true
+    - cp semgrep-report.json /tmp/reports/ || true
+    - cp semgrep-report.sarif /tmp/reports/ || true
+    - cp trivy-report.json /tmp/reports/ || true
+    - cp gitleaks-report.json /tmp/reports/ || true
+    - ls -la /tmp/reports/
+    - cat /tmp/reports/REPORT.txt
+    - git config user.name "CI/CD Pipeline"
+    - git config user.email "ci@gitlab.oroshi.app"
+    - git checkout --orphan fail-release/v${APP_VERSION}
+    - git rm -rf . || true
+    - cp -r /tmp/reports/* .
+    - git add .
+    - git commit -m "fail-release v${APP_VERSION} [skip ci]"
+    - git remote set-url origin https://cicd-push:${PROJECT_TOKEN}@gitlab.oroshi.app/${CI_PROJECT_PATH}.git
+    - git push origin fail-release/v${APP_VERSION}
+    - echo "=== Galaz fail-release/v${APP_VERSION} utworzona ==="
+  artifacts:
+    when: always
+    paths:
+      - /tmp/reports/
+    expire_in: 30 days
+    name: "fail-release-v${APP_VERSION}"
+
+create-release:
+  stage: result
+  needs: [unit-tests, sonarqube, sast-semgrep, dependency-scan, secret-detection]
+  image: alpine:latest
+  before_script: []
+  cache: []
+  script:
+    - apk add --no-cache git curl
+    - echo "=== RELEASE v${APP_VERSION} ==="
+    - mkdir -p /tmp/release
+    - cp target/*.jar /tmp/release/
+    - echo "status=SUCCESS" > /tmp/release/RELEASE.txt
+    - echo "version=${APP_VERSION}" >> /tmp/release/RELEASE.txt
+    - echo "pipeline_id=${CI_PIPELINE_ID}" >> /tmp/release/RELEASE.txt
+    - echo "pipeline_url=${CI_PIPELINE_URL}" >> /tmp/release/RELEASE.txt
+    - echo "commit=${CI_COMMIT_SHA}" >> /tmp/release/RELEASE.txt
+    - echo "branch=${CI_COMMIT_BRANCH}" >> /tmp/release/RELEASE.txt
+    - echo "author=${GITLAB_USER_LOGIN}" >> /tmp/release/RELEASE.txt
+    - echo "date=$(date -Iseconds)" >> /tmp/release/RELEASE.txt
+    - ls -la /tmp/release/
+    - cat /tmp/release/RELEASE.txt
+    - >-
+      curl --fail --request POST
+      --header "PRIVATE-TOKEN: ${PROJECT_TOKEN}"
+      --data-urlencode "tag_name=v${APP_VERSION}"
+      --data-urlencode "ref=${CI_COMMIT_SHA}"
+      --data-urlencode "message=release v${APP_VERSION}"
+      "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/repository/tags"
+    - git config user.name "CI/CD Pipeline"
+    - git config user.email "ci@gitlab.oroshi.app"
+    - git checkout --orphan release/v${APP_VERSION}
+    - git rm -rf . || true
+    - cp -r /tmp/release/* .
+    - git add .
+    - git commit -m "release v${APP_VERSION} [skip ci]"
+    - git remote set-url origin https://cicd-push:${PROJECT_TOKEN}@gitlab.oroshi.app/${CI_PROJECT_PATH}.git
+    - git push origin release/v${APP_VERSION}
+    - echo "=== RELEASE v${APP_VERSION} GOTOWY ==="
+  artifacts:
+    paths:
+      - /tmp/release/
+    expire_in: 90 days
+    name: "release-v${APP_VERSION}"
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH == "master"
+  environment:
+    name: release/v${APP_VERSION}
+    url: ${CI_PROJECT_URL}/-/tags/v${APP_VERSION}
